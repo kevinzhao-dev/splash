@@ -28,7 +28,7 @@ if __name__ == "__main__" and not __package__:
 # exists.
 from server import diagnostics, serve_options, serve_record, unix_socket
 
-from . import clients, paths
+from . import autoregressive, clients, paths
 from . import models as model_artifacts
 
 ROOT = paths.ROOT
@@ -674,6 +674,24 @@ def parse_args(argv=None):
     )
     parser.add_argument("--version", action="version", version=_version())
     commands = parser.add_subparsers(dest="command", required=True)
+    generate = commands.add_parser(
+        "generate", help="generate text from a supported local GGUF", allow_abbrev=False
+    )
+    generate.add_argument("--model", type=Path, required=True, metavar="GGUF")
+    generate.add_argument("--prompt", required=True)
+    generate.add_argument("--max-tokens", type=int, default=64)
+    generate.add_argument(
+        "--lookup-tokens",
+        type=int,
+        default=15,
+        help="prompt-lookup tokens each forward verifies; 0 decodes one token a forward",
+    )
+    generate.add_argument(
+        "--draft",
+        type=Path,
+        metavar="DIR",
+        help="a local DFlash draft checkpoint whose blocks each forward verifies, in place of lookup",
+    )
     server = commands.add_parser(
         "serve",
         help="run the local server; Ctrl+C stops it",
@@ -763,6 +781,10 @@ def parse_args(argv=None):
             client_args = client_args[1:]
     else:
         args = parser.parse_args(argv)
+    if args.command == "generate":
+        if client_args:
+            parser.error("arguments after -- are only supported for coding clients")
+        return args
     # An explicit --port wins; SPLASH_PORT is read only without one.
     args.explicit_port = args.port is not None
     if not args.explicit_port:
@@ -828,6 +850,8 @@ def main(argv=None):
             )
         raise
     try:
+        if args.command == "generate":
+            return autoregressive.generate(args)
         return serve(args) if args.command == "serve" else coding_client(args)
     except LauncherError as error:
         if not error.said:

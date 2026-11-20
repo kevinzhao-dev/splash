@@ -1,3 +1,4 @@
+#include "Autoregressive.hpp"
 #include "AwakeClock.hpp"
 #include "LegacyWeightCache.hpp"
 #include "StderrLine.hpp"
@@ -18,11 +19,13 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <charconv>
 #include <csignal>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <limits.h>
 #include <memory>
 #include <optional>
@@ -157,6 +160,9 @@ void printUsage(std::string_view executable) {
       " [--kv-spill always] [--kv-window-trim on|off] [--verify-rows auto|all]");
   writeStderrLine("       " + command + " model-check mlx-affine none|safetensors CONFIG [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " model-check gguf none|gguf CONFIG GGUF_HEADERS [DRAFT_CONFIG]");
+  writeStderrLine("       " + command + " autoregressive-check GGUF");
+  writeStderrLine("       " + command + " autoregressive GGUF METALLIB TOKEN_IDS MAX_NEW [PROMPT_LOGITS]"
+                  " [--lookup-tokens N] [--draft DIR]");
   writeStderrLine("       " + command + " device-check");
   writeStderrLine("       " + command + " families");
 }
@@ -476,6 +482,68 @@ int checkModel(int argc, char **argv) {
   return 0;
 }
 
+uint32_t parseCount(std::string_view text, const char *error) {
+  uint32_t value = 0;
+  const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+  if (text.empty() || parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size())
+    throw engine::UsageError(error);
+  return value;
+}
+
+int autoregressive(int argc, char **argv) {
+  if (argc < 6)
+    throw engine::UsageError("autoregressive takes a GGUF, Metal library, token ID file and maximum new tokens");
+  const uint32_t newTokens = parseCount(argv[5], "maximum new tokens must be an unsigned integer");
+  model::AutoregressiveOptions options{.lookupTokens = model::kDefaultLookupTokens};
+  const char *logitsPath = nullptr;
+  for (int arg = 6; arg < argc; ++arg) {
+    if (std::string_view(argv[arg]) == "--lookup-tokens" && arg + 1 < argc) {
+      options.lookupTokens = parseCount(argv[++arg], "--lookup-tokens takes an unsigned integer");
+      if (options.lookupTokens > model::kMaximumLookupTokens)
+        throw engine::UsageError("--lookup-tokens takes at most " + std::to_string(model::kMaximumLookupTokens));
+    } else if (std::string_view(argv[arg]) == "--draft" && arg + 1 < argc) {
+      options.draft = argv[++arg];
+    } else if (!logitsPath && std::string_view(argv[arg]).substr(0, 2) != "--") {
+      logitsPath = argv[arg];
+    } else {
+      throw engine::UsageError("autoregressive takes one prompt logits path, --lookup-tokens N and --draft DIR");
+    }
+  }
+  std::ifstream input(argv[4]);
+  if (!input) throw engine::UsageError("cannot read the token ID file");
+  std::vector<uint32_t> prompt;
+  for (uint32_t token; input >> token;) {
+    if (prompt.size() == model::kAutoregressiveContextLimit)
+      throw engine::UsageError("token ID file exceeds the autoregressive context limit");
+    prompt.push_back(token);
+  }
+  if (!input.eof()) throw engine::UsageError("expected whitespace-separated decimal token IDs");
+  const auto result = model::generateAutoregressive(argv[2], argv[3], prompt, newTokens, options);
+  if (logitsPath) {
+    std::ofstream output(logitsPath, std::ios::binary);
+    output.write(reinterpret_cast<const char *>(result.promptLogits.data()),
+                 static_cast<std::streamsize>(result.promptLogits.size() * sizeof(float)));
+    if (!output) throw std::runtime_error("cannot write prompt logits");
+  }
+  json::Writer response;
+  response.object([&] {
+    response.array("tokens", [&] { for (uint32_t token : result.tokens) response.value(token); });
+    response.field("prompt_tokens", prompt.size())
+        .field("load_seconds", result.loadSeconds)
+        .field("prefill_seconds", result.prefillSeconds)
+        .field("decode_seconds", result.decodeSeconds)
+        .field("lookup_tokens", options.draft.empty() ? options.lookupTokens : 0)
+        .field("draft", !options.draft.empty())
+        .field("decode_cycles", result.decodeCycles)
+        .field("decode_rows", result.decodeRows)
+        .field("proposed_tokens", result.proposedTokens)
+        .field("accepted_tokens", result.acceptedTokens)
+        .field("weight_and_kv_bytes", result.weightAndKvBytes);
+  });
+  std::printf("%s\n", response.str().c_str());
+  return 0;
+}
+
 // What each family's layout gives the options a start takes
 // (model::familyFacts), as JSON by family, which the installer reports to the
 // app (install/families.py).
@@ -510,6 +578,13 @@ int main(int argc, char **argv) {
         return splash::checkDevice(argc);
       if (command == "model-check")
         return splash::checkModel(argc, argv);
+      if (command == "autoregressive-check") {
+        if (argc != 3) throw splash::engine::UsageError("autoregressive-check takes one GGUF header");
+        splash::model::checkAutoregressiveConfiguration(argv[2]);
+        return 0;
+      }
+      if (command == "autoregressive")
+        return splash::autoregressive(argc, argv);
       if (command == "families")
         return splash::printFamilies(argc);
       if (command == "serve-native")
