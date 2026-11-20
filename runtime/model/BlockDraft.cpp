@@ -1,6 +1,6 @@
 #include "model/BlockDraft.hpp"
 
-#include "metal/abi/QuantFormat.h"
+#include "model/DraftCheckpoint.hpp"
 #include "model/GgufPreparation.hpp"
 #include "model/SafetensorsCheckpoint.hpp"
 #include "model/WeightStore.hpp"
@@ -24,60 +24,6 @@ namespace {
 constexpr uint32_t kHeadDimension = ops::BlockDraftAttention::kHeadDimension;
 constexpr uint64_t kBf16 = sizeof(uint16_t);
 
-// Plans one image from the checkpoint's BF16 tensors, which must have the
-// shapes the draft reads: norms copied as stored, projections quantized into
-// af4g64 planes as the DFlash2 drafts' are (model/DraftCheckpoint.cpp), or
-// into Q8_0 as a GGUF's BF16 tensors are (quantize_row_q8_0_ref).
-class Builder {
-public:
-  Builder(const SafetensorsCheckpoint &checkpoint, std::string name, uint32_t layer, uint32_t type,
-          uint32_t format)
-      : checkpoint_(checkpoint), image_(std::move(name), layer, type), format_(format) {}
-
-  void stored(const std::string &name, uint64_t width) {
-    const SourceTensor &tensor = require(name, {width});
-    image_.copy({name, ggml::kBF16, tensor.offset, 1, tensor.bytes, {}, tensor.file});
-  }
-
-  // A projection of `columns` inputs: its parts' rows in order.
-  void projection(std::initializer_list<std::pair<std::string, uint64_t>> parts, uint64_t columns) {
-    const QuantFormat &format = kQuantFormats[format_];
-    std::vector<gguf::TensorRows> sources;
-    uint64_t rows = 0;
-    for (const auto &[name, count] : parts) {
-      const SourceTensor &tensor = require(name + ".weight", {count, columns});
-      if (format_ == GGUF_FMT_AF4G64) {
-        sources.push_back({name, format.ggml_type, 0, count, ggufRowBytes(format, columns), {}, tensor.file,
-                           {.bfloat16 = &tensor}});
-      } else {
-        gguf::TensorRows source{name, ggml::kQ8_0, tensor.offset, count, ggufRowBytes(format, columns), {},
-                                tensor.file};
-        source.ggufFloatType = ggml::kBF16;
-        source.ggufFloatRowBytes = columns * sizeof(uint16_t);
-        sources.push_back(std::move(source));
-      }
-      rows += count;
-    }
-    gguf::Repack repack = image_.planes(format_, rows, columns, parts.begin()->first);
-    repack.sources = std::move(sources);
-    image_.repack(std::move(repack));
-  }
-
-  [[nodiscard]] gguf::Image finish() { return image_.finish(); }
-
-private:
-  const SourceTensor &require(const std::string &name, const std::vector<uint64_t> &shape) const {
-    const SourceTensor &tensor = checkpoint_.require(name);
-    if (tensor.dtype != "BF16" || tensor.shape != shape)
-      throw WeightStoreError("block draft tensor type or shape does not match: " + name);
-    return tensor;
-  }
-
-  const SafetensorsCheckpoint &checkpoint_;
-  gguf::ImageBuilder image_;
-  uint32_t format_;
-};
-
 // Each layer's image: its input norm, its block rows' QKV projection, its
 // context rows' KV projection (the same keys' and values' rows), its q/k
 // norms, output projection, post-attention norm and SwiGLU projections. Then
@@ -87,24 +33,24 @@ std::vector<gguf::Image> planImages(const SafetensorsCheckpoint &checkpoint, con
   const uint64_t hidden = layout.hiddenSize, queries = uint64_t{layout.queryHeads} * kHeadDimension;
   const uint64_t kv = uint64_t{layout.kvHeads} * kHeadDimension, intermediate = layout.intermediateSize;
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
-    Builder b(checkpoint, "layer-" + std::to_string(layer) + ".bin", layer, 0, layout.format);
+    DraftImageBuilder b(checkpoint, "layer-" + std::to_string(layer) + ".bin", layer, 0);
     const std::string prefix = "layers." + std::to_string(layer) + ".", attention = prefix + "self_attn.";
-    b.stored(prefix + "input_layernorm.weight", hidden);
+    b.stored(prefix + "input_layernorm.weight", {hidden});
     b.projection({{attention + "q_proj", queries}, {attention + "k_proj", kv}, {attention + "v_proj", kv}}, hidden);
     b.projection({{attention + "k_proj", kv}, {attention + "v_proj", kv}}, hidden);
-    b.stored(attention + "q_norm.weight", kHeadDimension);
-    b.stored(attention + "k_norm.weight", kHeadDimension);
+    b.stored(attention + "q_norm.weight", {kHeadDimension});
+    b.stored(attention + "k_norm.weight", {kHeadDimension});
     b.projection({{attention + "o_proj", hidden}}, queries);
-    b.stored(prefix + "post_attention_layernorm.weight", hidden);
+    b.stored(prefix + "post_attention_layernorm.weight", {hidden});
     b.projection({{prefix + "mlp.gate_proj", intermediate}}, hidden);
     b.projection({{prefix + "mlp.up_proj", intermediate}}, hidden);
     b.projection({{prefix + "mlp.down_proj", hidden}}, intermediate);
     images.push_back(b.finish());
   }
-  Builder b(checkpoint, "model.bin", layout.layers, 1, layout.format);
+  DraftImageBuilder b(checkpoint, "model.bin", layout.layers, 1);
   b.projection({{"fc", hidden}}, layout.contextWidth());
-  b.stored("hidden_norm.weight", hidden);
-  b.stored("norm.weight", hidden);
+  b.stored("hidden_norm.weight", {hidden});
+  b.stored("norm.weight", {hidden});
   images.push_back(b.finish());
   return images;
 }
@@ -123,8 +69,6 @@ struct BlockDraft::Impl final {
         contextRows(maximumContextRows),
         operators(backend.capabilities(), ops::Int8Activations::Off),
         planned(std::make_shared<Planned>(checkpoint)) {
-    if (layout.format != GGUF_FMT_AF4G64 && layout.format != GGUF_FMT_Q80)
-      throw std::invalid_argument("a block draft's projections are af4g64 or Q8_0");
     if (layout.hiddenSize % 64 || layout.contextWidth() % 64)
       throw std::invalid_argument("block draft widths are not af4g64 groups");
     planned->images = planImages(planned->checkpoint, layout);
@@ -168,7 +112,7 @@ struct BlockDraft::Impl final {
     file.finish();
     for (float &frequency : frequencies) {
       const auto pair = static_cast<float>(&frequency - frequencies.data());
-      frequency = 1.0F / std::pow(layout.ropeTheta, 2.0F * pair / float(kHeadDimension));
+      frequency = 1.0F / std::pow(layout.ropeTheta, 2.0F * pair / static_cast<float>(kHeadDimension));
     }
   }
 
@@ -245,7 +189,7 @@ struct BlockDraft::Impl final {
     auto *cos = static_cast<float *>(cosines.contents()), *sin = static_cast<float *>(sines.contents());
     for (uint32_t row = 0; row < rows; ++row)
       for (float frequency : frequencies) {
-        const float angle = float(position + row) * frequency;
+        const float angle = static_cast<float>(position + row) * frequency;
         *cos++ = std::cos(angle);
         *sin++ = std::sin(angle);
       }
@@ -282,7 +226,7 @@ struct BlockDraft::Impl final {
     writeAngles(blockCosines, blockSines, block, position);
     ops::Embedding::add(graph, tokens, embedding, residual[0], block);
     if (layout.inputScale != 1.0F) ops::scaleRows(graph, residual[0], hidden * block, layout.inputScale);
-    const float scale = 1.0F / std::sqrt(float(kHeadDimension));
+    const float scale = 1.0F / std::sqrt(static_cast<float>(kHeadDimension));
     for (uint32_t layer = 0; layer < layout.layers; ++layer) {
       const Layer &w = layers[layer];
       const bool sliding = layout.sliding(layer);

@@ -152,8 +152,8 @@ check-source: architecture-check
 
 test: test-engine test-python
 
-# The native autoregressive command takes token IDs. This optional tool uses
-# llama.cpp for GGUF tokenization and for an independent logits reference.
+# gemma4-benchmark takes token IDs. This optional tool uses llama.cpp for
+# GGUF tokenization and for an independent logits reference.
 LLAMA_CPP_PREFIX ?= /opt/homebrew/opt/llama.cpp
 GGML_PREFIX ?= /opt/homebrew/opt/ggml
 $(BUILD)/gguf-text: dev/tools/gguf_text.cpp runtime/engine/Json.hpp | $(BUILD)

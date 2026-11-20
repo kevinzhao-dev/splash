@@ -115,14 +115,67 @@ void reference(llama_model *model, const llama_vocab *vocab, const char *ids, st
   std::cout << output.str() << '\n';
 }
 
+// Each position's top token of llama.cpp's logits, teacher-forced over the
+// token IDs in batches of kBatch, and how far its best logit is above its
+// second: a line a position but the last.
+void teacher(llama_model *model, const llama_vocab *vocab, const char *ids) {
+  std::ifstream input(ids);
+  if (!input) throw std::runtime_error("cannot read the token IDs");
+  const auto tokens = readTokens(input, vocab);
+  if (tokens.size() < 2) throw std::runtime_error("teacher forcing needs two tokens");
+  auto parameters = llama_context_default_params();
+  parameters.n_ctx = kContext;
+  parameters.n_batch = kBatch;
+  parameters.n_ubatch = kBatch;
+  parameters.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+  const std::unique_ptr<llama_context, decltype(&llama_free)> context(llama_init_from_model(model, parameters),
+                                                                    llama_free);
+  if (!context) throw std::runtime_error("could not start the llama.cpp reference context");
+  llama_batch batch = llama_batch_init(kBatch, 0, 1);
+  const int32_t vocabSize = llama_vocab_n_tokens(vocab);
+  const size_t positions = tokens.size() - 1;
+  for (size_t first = 0; first < positions; first += kBatch) {
+    batch.n_tokens = static_cast<int32_t>(std::min<size_t>(kBatch, positions - first));
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+      batch.token[i] = tokens[first + i];
+      batch.pos[i] = static_cast<llama_pos>(first + i);
+      batch.n_seq_id[i] = 1;
+      batch.seq_id[i][0] = 0;
+      batch.logits[i] = 1;
+    }
+    if (llama_decode(context.get(), batch) != 0) {
+      llama_batch_free(batch);
+      throw std::runtime_error("llama.cpp decode failed");
+    }
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+      const float *logits = llama_get_logits_ith(context.get(), i);
+      if (!logits) throw std::runtime_error("llama.cpp did not return logits");
+      int32_t best = 0;
+      float top = logits[0], second = -std::numeric_limits<float>::infinity();
+      for (int32_t token = 1; token < vocabSize; ++token) {
+        if (logits[token] > top) {
+          second = top;
+          top = logits[token];
+          best = token;
+        } else if (logits[token] > second) {
+          second = logits[token];
+        }
+      }
+      std::cout << best << ' ' << top - second << '\n';
+    }
+  }
+  llama_batch_free(batch);
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
   try {
     const std::string_view action = argc >= 2 ? argv[1] : "";
     const bool vocabOnly = action == "tokenize" || action == "detokenize";
-    if (!(vocabOnly && argc == 3) && !(action == "reference" && argc == 6))
-      throw std::runtime_error("usage: gguf-text tokenize|detokenize GGUF, or gguf-text reference GGUF IDS MAX LOGITS");
+    if (!(vocabOnly && argc == 3) && !(action == "reference" && argc == 6) && !(action == "teacher" && argc == 4))
+      throw std::runtime_error("usage: gguf-text tokenize|detokenize GGUF, gguf-text reference GGUF IDS MAX LOGITS, "
+                               "or gguf-text teacher GGUF IDS");
     ggml_backend_load_all();
     auto parameters = llama_model_default_params();
     parameters.vocab_only = vocabOnly;
@@ -133,6 +186,7 @@ int main(int argc, char **argv) {
     const auto *vocab = llama_model_get_vocab(model.get());
     if (action == "tokenize") tokenize(vocab);
     else if (action == "detokenize") detokenize(vocab);
+    else if (action == "teacher") teacher(model.get(), vocab, argv[3]);
     else reference(model.get(), vocab, argv[3], argv[4], argv[5]);
     return 0;
   } catch (const std::exception &error) {

@@ -2,7 +2,6 @@
 
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
-#include "metal/abi/QuantFormat.h"
 #include "model/WeightImages.hpp"
 #include "ops/Embedding.hpp"
 #include "ops/Linear.hpp"
@@ -41,9 +40,6 @@ struct BlockDraftLayout final {
   float ropeTheta = 0.0F;
   float epsilon = 0.0F;
   float inputScale = 1.0F;
-  // The projections' format as they load (metal/abi/QuantFormat.h):
-  // GGUF_FMT_AF4G64 or GGUF_FMT_Q80.
-  uint32_t format = GGUF_FMT_AF4G64;
 
   [[nodiscard]] bool sliding(uint32_t layer) const noexcept { return (slidingLayers >> layer) & 1U; }
   [[nodiscard]] uint32_t contextWidth() const noexcept {

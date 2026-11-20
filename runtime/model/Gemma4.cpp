@@ -1,6 +1,6 @@
-#include "Autoregressive.hpp"
-#include "AwakeClock.hpp"
+#include "model/Gemma4.hpp"
 
+#include "AwakeClock.hpp"
 #include "model/BlockDraft.hpp"
 
 #include "metal/abi/Gguf.h"
@@ -29,12 +29,26 @@
 namespace splash::model {
 namespace {
 
-constexpr uint32_t kLayers = 60, kHidden = 5376, kQueryHeads = 32, kIntermediate = 21504;
-constexpr uint32_t kVocab = 262144, kGlobalHeads = 4, kGlobalDim = 512, kLocalHeads = 16, kLocalDim = 256;
-constexpr uint32_t kNativeContext = 262144;
-constexpr uint32_t kWindow = 1024, kEndOfSequence = 1, kEndOfTurn = 106;
-constexpr uint32_t kPrefillRows = 512, kExtentPages = 4;
-constexpr float kGlobalTheta = 1'000'000.0f, kLocalTheta = 10'000.0f, kSoftcap = 30.0f;
+// The checkpoint's shape (Gemma4.hpp), which its header must state.
+constexpr uint32_t kLayers = 60;
+constexpr uint32_t kHidden = 5376;
+constexpr uint32_t kQueryHeads = 32;
+constexpr uint32_t kIntermediate = 21504;
+constexpr uint32_t kVocab = kGemma4Vocabulary;
+constexpr uint32_t kGlobalHeads = 4;
+constexpr uint32_t kGlobalDim = 512;
+constexpr uint32_t kLocalHeads = 16;
+constexpr uint32_t kLocalDim = 256;
+constexpr uint32_t kNativeContext = 262'144;
+constexpr uint32_t kWindow = 1024;
+constexpr uint32_t kEndOfSequence = 1;
+constexpr uint32_t kEndOfTurn = 106;
+constexpr float kGlobalTheta = 1'000'000.0F;
+constexpr float kLocalTheta = 10'000.0F;
+constexpr float kSoftcap = 30.0F;
+// A prompt's chunk: 512 rows prefilled 7.7% faster than 128 on an M5 Pro.
+constexpr uint32_t kPrefillRows = 512;
+constexpr uint32_t kExtentPages = 4;
 constexpr auto kQ4Type = kQuantFormats[GGUF_FMT_Q40].ggml_type;
 constexpr auto kEmbeddingType = kQuantFormats[GGUF_FMT_Q6K].ggml_type;
 using Clock = AwakeClock;
@@ -66,7 +80,7 @@ kv::Layout inspectLayout(const GgufFile &file) {
   const std::pair<std::string_view, double> floats[] = {
       {"gemma4.rope.freq_base", kGlobalTheta}, {"gemma4.rope.freq_base_swa", kLocalTheta},
       {"gemma4.final_logit_softcapping", kSoftcap},
-      {"gemma4.attention.layer_norm_rms_epsilon", double(float(SPLASH_RMS_EPSILON))},
+      {"gemma4.attention.layer_norm_rms_epsilon", static_cast<double>(static_cast<float>(SPLASH_RMS_EPSILON))},
   };
   for (auto [name, value] : floats)
     if (meta.floatValue(name) != value) throw GgufError("unsupported Gemma 4 metadata: " + std::string(name));
@@ -196,7 +210,7 @@ Weights loadWeights(metal::MetalBackend &backend, WeightImages &images, PlannedW
   std::memcpy(weights.ropeFactors.data(), image.read(sizeof(weights.ropeFactors), "global RoPE factors").data(),
               sizeof(weights.ropeFactors));
   for (float factor : weights.ropeFactors)
-    if (!(factor >= 1.0f) || !std::isfinite(factor)) throw GgufError("invalid Gemma 4 global RoPE factor");
+    if (!(factor >= 1.0F) || !std::isfinite(factor)) throw GgufError("invalid Gemma 4 global RoPE factor");
   weights.finalNorm = readNorm(image, kHidden, true, "output RMS norm");
   weights.embedding = readBlockEmbedding(image, kVocab, kHidden, "token embedding");
   weights.logits = readBlockProjection(image, kVocab, kHidden, "tied vocabulary projection");
@@ -254,8 +268,8 @@ public:
       rope.cosine = allocate(uint64_t{storageRows} * dim / 2 * sizeof(float), "rope-cosine");
       rope.sine = allocate(rope.cosine.sizeBytes(), "rope-sine");
       for (uint32_t i = 0; i < dim / 2; ++i) {
-        const float factor = variant == 0 ? weights.ropeFactors[i] : 1.0f;
-        rope.frequency.push_back(std::pow(theta, -2.0f * float(i) / float(dim)) / factor);
+        const float factor = variant == 0 ? weights.ropeFactors[i] : 1.0F;
+        rope.frequency.push_back(std::pow(theta, -2.0F * static_cast<float>(i) / static_cast<float>(dim)) / factor);
       }
     }
   }
@@ -285,7 +299,7 @@ public:
     const ops::Linear &linear = operators_.linear();
     metal::CommandGraph graph;
     ops::Embedding::add(graph, tokens_, weights_.embedding, hidden_, rows);
-    ops::scaleRows(graph, hidden_, kHidden * rows, std::sqrt(float(kHidden)));
+    ops::scaleRows(graph, hidden_, kHidden * rows, std::sqrt(static_cast<float>(kHidden)));
     for (uint32_t layer = 0; layer < kLayers; ++layer) {
       const auto &w = weights_.layers[layer];
       const auto shape = pages_.layout().layerLayout(layer);
@@ -302,7 +316,7 @@ public:
                                         attentionRows, {{}, attended_});
       linear.addProjection(graph, attended_, w.attentionOut, update_, rows, scratch_);
       ops::Normalization::addRms(graph, update_, w.postAttention, normalized_, kHidden, rows);
-      ops::addScaledResidual(graph, hidden_, normalized_, kHidden * rows, 1.0f);
+      ops::addScaledResidual(graph, hidden_, normalized_, kHidden * rows, 1.0F);
 
       ops::Normalization::addRms(graph, hidden_, w.ffn, normalized_, kHidden, rows);
       linear.addProjection(graph, normalized_, w.gate, gate_, rows, scratch_);
@@ -316,7 +330,8 @@ public:
         const auto at = std::ranges::find(captured, layer);
         if (at != captured.end())
           ops::RowCopy::add(graph, hidden_, {0, kHidden, 0}, draft_->context(),
-                            {0, draft_->layout().contextWidth(), static_cast<uint32_t>(at - captured.begin()) * kHidden},
+                            {0, draft_->layout().contextWidth(),
+                             static_cast<uint32_t>(at - captured.begin()) * kHidden},
                             rows, kHidden);
       }
     }
@@ -326,7 +341,7 @@ public:
       ops::Normalization::addRms(graph, std::move(last), weights_.finalNorm, normalized_, kHidden, logitRows);
       linear.addProjection(graph, normalized_, weights_.logits, logits_, logitRows, scratch_);
     }
-    static_cast<void>(backend_.submitCommandAsync(graph.dispatches()).wait());
+    gpuSeconds_ = backend_.submitCommandAsync(graph.dispatches()).wait().gpuSeconds;
     position_ += rows;
     return {static_cast<const float *>(logits_.contents()), size_t{kVocab} * logitRows};
   }
@@ -342,14 +357,16 @@ public:
   // after the written ones: its raw logits of the tokens after the anchor.
   std::span<const float> draft(uint32_t anchor) {
     metal::CommandGraph graph;
+    if (!draft_) throw std::logic_error("a Gemma 4 forward without a draft drafts no block");
     draft_->addBlock(graph, anchor, position_, weights_.embedding, weights_.logits);
-    static_cast<void>(backend_.submitCommandAsync(graph.dispatches()).wait());
+    gpuSeconds_ = backend_.submitCommandAsync(graph.dispatches()).wait().gpuSeconds;
     return draft_->logits();
   }
 
   [[nodiscard]] bool drafts() const noexcept { return draft_ != nullptr; }
   [[nodiscard]] uint32_t position() const noexcept { return position_; }
   [[nodiscard]] uint64_t kvBytes() const noexcept { return pages_.actualAllocatedBytes(); }
+  [[nodiscard]] double gpuSeconds() const noexcept { return gpuSeconds_; }
 
 private:
   struct Rotary final {
@@ -367,7 +384,7 @@ private:
       auto *cos = static_cast<float *>(rope.cosine.contents()), *sin = static_cast<float *>(rope.sine.contents());
       for (uint32_t row = 0; row < rows; ++row) {
         for (float frequency : rope.frequency) {
-          const float angle = float(position_ + row) * frequency;
+          const float angle = static_cast<float>(position_ + row) * frequency;
           *cos++ = std::cos(angle);
           *sin++ = std::sin(angle);
         }
@@ -388,11 +405,11 @@ private:
   std::array<Rotary, 2> rope_;
   std::vector<uint32_t> logicalPages_;
   uint32_t position_ = 0;
+  double gpuSeconds_ = 0;
 };
 
-// The block of the DFlash draft released for this checkpoint
-// (z-lab/gemma-4-31B-it-DFlash): a forward verifies its anchor and 15 drafted
-// tokens.
+// A forward verifies a draft block's anchor and its 15 drafted tokens: 16
+// rows, 11% more than a forward of one.
 constexpr uint32_t kDraftBlock = 16;
 
 BlockDraftLayout draftLayout(const std::filesystem::path &checkpoint) {
@@ -417,7 +434,7 @@ uint32_t greedy(std::span<const float> logits) {
     top = std::max(top, logit);
   }
   const float best = softcap(top);
-  float margin = 1.0f / 64;
+  float margin = 1.0F / 64;
   while (softcap(top - margin) >= best) margin *= 2;
   const float bound = top - margin;
   for (size_t token = 0;; ++token)
@@ -432,7 +449,7 @@ uint32_t greedy(std::span<const float> logits) {
 // keeps the proposals its own selections repeat and the next selection after
 // them; the keys and values of the rest are rewound.
 void decode(Forward &forward, std::span<const float> promptLogits, std::span<const uint32_t> prompt,
-            uint32_t newTokens, uint32_t lookupTokens, AutoregressiveResult &result) {
+            uint32_t newTokens, uint32_t lookupTokens, Gemma4Generation &result) {
   LookupIndex lookup;
   if (lookupTokens) lookup.append(prompt);
   uint32_t token = greedy(promptLogits);
@@ -470,21 +487,69 @@ void decode(Forward &forward, std::span<const float> promptLogits, std::span<con
   }
 }
 
-// Prefills the prompt in chunks of up to kPrefillRows rows and decodes up to
-// `newTokens` tokens into `result`; returns the KV bytes it allocated.
-uint64_t generate(metal::MetalBackend &backend, const Weights &weights, kv::Layout layout,
-                  std::span<const uint32_t> prompt, uint32_t newTokens, AutoregressiveOptions options,
-                  AutoregressiveResult &result, BlockDraft *draft = nullptr) {
-  if (draft) options.lookupTokens = 0;
-  const uint32_t capacity = static_cast<uint32_t>(prompt.size()) + newTokens;
-  const uint32_t prefillRows = std::min(kPrefillRows, static_cast<uint32_t>(prompt.size()));
-  const uint32_t storageRows = ceilDiv(prefillRows, GGUF_PREFILL_ROWS) * GGUF_PREFILL_ROWS;
-  const uint32_t verifyRows = draft ? draft->layout().blockSize : 1 + options.lookupTokens;
-  Forward forward(backend, weights, layout, capacity, storageRows, verifyRows, draft);
+// The rows a forward of chunks of up to `rows` rows stores: whole prefill
+// tiles.
+uint32_t storageRows(uint32_t rows) {
+  return ceilDiv(std::min(kPrefillRows, rows), GGUF_PREFILL_ROWS) * GGUF_PREFILL_ROWS;
+}
+
+} // namespace
+
+struct Gemma4::Impl final {
+  Impl(const std::filesystem::path &gguf, const std::filesystem::path &library,
+       const std::filesystem::path &draftCheckpoint)
+      : plan(planWeights(gguf, GgufContents::Files)), backend(library), images(backend, {}) {
+    // The KV of the whole context and 1 GiB of workspace beside the weights.
+    constexpr uint64_t workspaceReserve = uint64_t{1} << 30;
+    const uint32_t extents = ceilDiv(ceilDiv(kGemma4ContextLimit, kv::kPageTokens), kExtentPages);
+    if (plan.bytes + extents * kExtentPages * plan.kv.bytesPerModelPage() + workspaceReserve >
+        backend.capabilities().recommendedMaxWorkingSetBytes)
+      throw std::runtime_error("Gemma 4 weights and KV exceed the device's recommended working set");
+    weights = loadWeights(backend, images, plan);
+    if (!draftCheckpoint.empty())
+      draft = std::make_unique<BlockDraft>(backend, images, draftCheckpoint, draftLayout(draftCheckpoint),
+                                           kGemma4ContextLimit + kDraftBlock, kPrefillRows);
+  }
+
+  PlannedWeights plan;
+  metal::MetalBackend backend;
+  WeightImages images;
+  Weights weights;
+  std::unique_ptr<BlockDraft> draft;
+};
+
+struct Gemma4::Sequence::Impl final {
+  template <class... Arguments>
+  explicit Impl(Arguments &&...arguments) : forward(std::forward<Arguments>(arguments)...) {}
+  Forward forward;
+};
+
+void Gemma4::check(const std::filesystem::path &gguf) { static_cast<void>(planWeights(gguf, GgufContents::Headers)); }
+
+Gemma4::Gemma4(const std::filesystem::path &gguf, const std::filesystem::path &library,
+               const std::filesystem::path &draft)
+    : impl_(std::make_unique<Impl>(gguf, library, draft)) {}
+
+Gemma4::~Gemma4() = default;
+
+Gemma4Generation Gemma4::generate(std::span<const uint32_t> prompt, uint32_t newTokens, uint32_t lookupTokens) {
+  if (prompt.empty() || prompt.size() > kGemma4ContextLimit || newTokens > kGemma4ContextLimit - prompt.size())
+    throw std::invalid_argument("prompt and generation must fit the 4096-token Gemma 4 context");
+  if (std::ranges::any_of(prompt, [](uint32_t id) { return id >= kVocab; }))
+    throw std::invalid_argument("a prompt token is outside the Gemma 4 vocabulary");
+  if (lookupTokens > kGemma4MaximumLookupTokens)
+    throw std::invalid_argument("too many Gemma 4 lookup tokens a forward");
+  BlockDraft *draft = impl_->draft.get();
+  if (draft) lookupTokens = 0;
+  const auto promptRows = static_cast<uint32_t>(prompt.size());
+  const uint32_t verifyRows = draft ? kDraftBlock : 1 + lookupTokens;
+  Forward forward(impl_->backend, impl_->weights, impl_->plan.kv, promptRows + newTokens, storageRows(promptRows),
+                  verifyRows, draft);
+  Gemma4Generation result;
   const auto prefill = Clock::now();
   std::span<const float> logits;
   for (auto rest = prompt; !rest.empty();) {
-    const auto chunk = rest.first(std::min<size_t>(prefillRows, rest.size()));
+    const auto chunk = rest.first(std::min<size_t>(kPrefillRows, rest.size()));
     rest = rest.subspan(chunk.size());
     logits = forward.run(chunk, rest.empty() ? 1 : 0);
   }
@@ -492,46 +557,37 @@ uint64_t generate(metal::MetalBackend &backend, const Weights &weights, kv::Layo
   result.promptLogits.resize(logits.size());
   std::ranges::transform(logits, result.promptLogits.begin(), softcap);
   const auto decoding = Clock::now();
-  if (newTokens) decode(forward, logits, prompt, newTokens, options.lookupTokens, result);
+  if (newTokens) decode(forward, logits, prompt, newTokens, lookupTokens, result);
   result.decodeSeconds = elapsed(decoding);
-  return forward.kvBytes();
-}
-
-} // namespace
-
-void checkAutoregressiveConfiguration(const std::filesystem::path &gguf) {
-  static_cast<void>(planWeights(gguf, GgufContents::Headers));
-}
-
-AutoregressiveResult generateAutoregressive(const std::filesystem::path &gguf, const std::filesystem::path &library,
-    std::span<const uint32_t> prompt, uint32_t newTokens, AutoregressiveOptions options) {
-  if (prompt.empty() || prompt.size() > kAutoregressiveContextLimit ||
-      newTokens > kAutoregressiveContextLimit - prompt.size())
-    throw std::invalid_argument("prompt and generation must fit the 4096-token autoregressive context");
-  if (std::ranges::any_of(prompt, [](uint32_t id) { return id >= kVocab; }))
-    throw std::invalid_argument("a prompt token is outside the Gemma 4 vocabulary");
-  if (options.lookupTokens > kMaximumLookupTokens)
-    throw std::invalid_argument("too many Gemma 4 lookup tokens a forward");
-  const auto loadStart = Clock::now();
-  auto plan = planWeights(gguf, GgufContents::Files);
-  metal::MetalBackend backend(library);
-  const uint32_t capacity = static_cast<uint32_t>(prompt.size()) + newTokens;
-  constexpr uint64_t workspaceReserve = uint64_t{1} << 30;
-  const uint32_t extents = ceilDiv(ceilDiv(capacity, kv::kPageTokens), kExtentPages);
-  if (plan.bytes + extents * kExtentPages * plan.kv.bytesPerModelPage() + workspaceReserve >
-      backend.capabilities().recommendedMaxWorkingSetBytes)
-    throw std::runtime_error("Gemma 4 weights and KV exceed the device's recommended working set");
-  WeightImages images(backend, {});
-  const auto weights = loadWeights(backend, images, plan);
-  std::unique_ptr<BlockDraft> draft;
-  if (!options.draft.empty())
-    draft = std::make_unique<BlockDraft>(backend, images, options.draft, draftLayout(options.draft), capacity + kDraftBlock,
-                                         kPrefillRows);
-  AutoregressiveResult result;
-  result.loadSeconds = elapsed(loadStart);
-  const uint64_t kvBytes = generate(backend, weights, plan.kv, prompt, newTokens, options, result, draft.get());
-  result.weightAndKvBytes = plan.bytes + kvBytes + (draft ? draft->bytes() : 0);
+  result.kvBytes = forward.kvBytes();
   return result;
 }
+
+Gemma4::Sequence Gemma4::sequence(uint32_t capacity, uint32_t logitRows, bool drafted) {
+  if (!capacity || capacity > kGemma4ContextLimit + kDraftBlock)
+    throw std::invalid_argument("a Gemma 4 sequence holds up to the 4096-token context and a block");
+  return Sequence(std::make_unique<Sequence::Impl>(impl_->backend, impl_->weights, impl_->plan.kv, capacity,
+                                                   storageRows(capacity), logitRows,
+                                                   drafted ? impl_->draft.get() : nullptr));
+}
+
+uint32_t Gemma4::select(std::span<const float> logits) { return greedy(logits); }
+bool Gemma4::drafts() const noexcept { return impl_->draft != nullptr; }
+uint64_t Gemma4::weightBytes() const noexcept {
+  return impl_->plan.bytes + (impl_->draft ? impl_->draft->bytes() : 0);
+}
+metal::MetalBackend &Gemma4::backend() noexcept { return impl_->backend; }
+
+Gemma4::Sequence::Sequence(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+Gemma4::Sequence::~Sequence() = default;
+Gemma4::Sequence::Sequence(Sequence &&) noexcept = default;
+
+std::span<const float> Gemma4::Sequence::forward(std::span<const uint32_t> tokens, uint32_t logitRows) {
+  return impl_->forward.run(tokens, logitRows);
+}
+void Gemma4::Sequence::rewind(uint32_t position) { impl_->forward.rewind(position); }
+std::span<const float> Gemma4::Sequence::draft(uint32_t anchor) { return impl_->forward.draft(anchor); }
+uint32_t Gemma4::Sequence::position() const noexcept { return impl_->forward.position(); }
+double Gemma4::Sequence::gpuSeconds() const noexcept { return impl_->forward.gpuSeconds(); }
 
 } // namespace splash::model

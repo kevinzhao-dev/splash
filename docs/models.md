@@ -294,6 +294,47 @@ inputs (next-token KL 2.8e-4 against bf16, 13-16% less time a decode cycle on a
 20-core M5 Pro), which `--activations bf16` turns off
 ([server options](server.md#server-options)).
 
+## Gemma 4 31B
+
+Google's QAT Q4_0 GGUF of Gemma 4 31B (`gemma-4-31B_q4_0-it.gguf`, GGUF
+architecture `gemma4`) loads into the model layer's own text runner
+(`runtime/model/Gemma4.hpp`), which `splash serve` does not use yet: one
+sequence of up to 4096 tokens, BF16 KV, greedy. Its header must hold the
+checkpoint's metadata and every tensor of its type and shape: 410 Q4_0
+projections, F32 norms and RoPE factors, and one Q6_K token table that is the
+vocabulary projection too. Its 50 sliding layers keep 16 KV heads of 256 and
+its 10 global layers 4 of 512 in one page layout, each kind in a region of
+every extent (`kv::Layout::windowKvHeads`). A prompt prefills in chunks of
+512 rows.
+
+Each forward verifies its pending token with proposals beside it and keeps
+the proposals its own greedy selections repeat: up to 15 prompt-lookup
+tokens, or the 15 tokens a DFlash v1 draft fills after the pending one. A v1
+checkpoint is `config.json` and BF16 `model.safetensors` of Qwen3 layers with
+no selector or convolutions (`DFlashDraftModel`); the one for this target has
+five layers of 64 query and 8 KV heads of 128, four of them causal over a
+2048-key window, and blocks of 16 (`readBlockDraftLayout`). Its projections
+load as af4g64, its attention runs in `block_draft_attention.metal`, and
+every target forward writes its rows' keys and values into the draft's cache
+from the outputs of the target layers the draft reads. On an M5 Pro, a
+forward of 16 rows took 11% longer than one of a single row, and the draft
+decoded 20 prose records into JSON at 97 tokens/s against 13 one token a
+forward.
+
+```sh
+make build/engine-tests/gemma4-benchmark build/gguf-text
+build/engine-tests/gemma4-benchmark build/splash.metallib GGUF [--draft DIR] generate TOKEN_IDS 256
+.venv/bin/python -m dev.tools.gemma4_parity GGUF
+```
+
+`gemma4-benchmark` also measures cold prefills, a forward's cost by its rows,
+each pipeline's GPU time, the draft's block and top-1 agreement with a
+reference under teacher forcing (its header lists the scenarios).
+`gemma4_parity` compares three prompts' last logits and greedy tokens with
+llama.cpp's on the same file: `build/gguf-text` tokenizes and computes the
+reference with the installed llama.cpp and ggml (`LLAMA_CPP_PREFIX`,
+`GGML_PREFIX`), and its `teacher` action writes each position's top token.
+
 ## Drafts
 
 Every model decodes with a DFlash2 draft. Each family names the repository

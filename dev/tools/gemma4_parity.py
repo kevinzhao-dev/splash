@@ -8,7 +8,10 @@ from array import array
 from heapq import nlargest
 from pathlib import Path
 
-from install.autoregressive import chat_prompt
+
+def chat_prompt(prompt):
+    """One user turn in Gemma 4's chat format, its reply after an empty thought."""
+    return f"<|turn>user\n{prompt.strip()}<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
 
 
 PROMPTS = {
@@ -25,7 +28,12 @@ PROMPTS = {
 def invoke(command, log, data=None):
     with log.open("wb") as errors:
         return subprocess.run(
-            command, input=data, stdout=subprocess.PIPE, stderr=errors, check=True, timeout=900
+            command,
+            input=data,
+            stdout=subprocess.PIPE,
+            stderr=errors,
+            check=True,
+            timeout=900,
         ).stdout
 
 
@@ -48,7 +56,9 @@ def compare(splash, reference, splash_tokens, reference_tokens):
         matched += 1
     return {
         "max_abs_logit_error": max(map(abs, differences)),
-        "rms_logit_error": math.sqrt(math.fsum(x * x for x in differences) / len(differences)),
+        "rms_logit_error": math.sqrt(
+            math.fsum(x * x for x in differences) / len(differences)
+        ),
         "top10_overlap": len(set(top_splash) & set(top_reference)),
         "splash_top10": [(token, splash[token]) for token in top_splash],
         "reference_top10": [(token, reference[token]) for token in top_reference],
@@ -61,8 +71,11 @@ def run_case(model, directory, name):
     tool = Path("build/gguf-text")
     tokens = directory / f"{name}.ids"
     tokens.write_bytes(
-        invoke([tool, "tokenize", model], directory / f"{name}.tokenizer.log",
-               chat_prompt(PROMPTS[name]).encode())
+        invoke(
+            [tool, "tokenize", model],
+            directory / f"{name}.tokenizer.log",
+            chat_prompt(PROMPTS[name]).encode(),
+        )
     )
     count = len(tokens.read_bytes().split())
     if name == "long" and count <= 1024:
@@ -70,11 +83,21 @@ def run_case(model, directory, name):
     native_logits = directory / f"{name}.splash.logits"
     ref_logits = directory / f"{name}.reference.logits"
     native = invoke(
-        ["build/splash", "autoregressive", model, "build/splash.metallib", tokens, "8", native_logits],
+        [
+            "build/engine-tests/gemma4-benchmark",
+            "build/splash.metallib",
+            model,
+            "generate",
+            tokens,
+            "8",
+            "--logits",
+            native_logits,
+        ],
         directory / f"{name}.splash.log",
     )
     reference = invoke(
-        [tool, "reference", model, tokens, "8", ref_logits], directory / f"{name}.reference.log"
+        [tool, "reference", model, tokens, "8", ref_logits],
+        directory / f"{name}.reference.log",
     )
     (directory / f"{name}.splash.json").write_bytes(native)
     (directory / f"{name}.reference.json").write_bytes(reference)
@@ -86,8 +109,12 @@ def run_case(model, directory, name):
         ).decode(errors="replace")
     native["prefill_tokens_per_second"] = count / native["prefill_seconds"]
     if native["decode_rows"]:
-        native["decode_tokens_per_second"] = native["decode_rows"] / native["decode_seconds"]
-    scores = compare(logits(native_logits), logits(ref_logits), native["tokens"], reference["tokens"])
+        native["decode_tokens_per_second"] = (
+            native["decode_rows"] / native["decode_seconds"]
+        )
+    scores = compare(
+        logits(native_logits), logits(ref_logits), native["tokens"], reference["tokens"]
+    )
     scores["passed"] = (
         scores["top10_overlap"] >= 8
         and scores["rms_logit_error"] <= 0.15

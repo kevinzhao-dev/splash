@@ -44,10 +44,17 @@ uint32_t tileParts(uint32_t queryHeads, kv::Layout layout) {
 //   without RoPE (NoPE) as well, for an AttentionVariant that is not rotated;
 // - windowTokens: a split and reduce over a window of that many keys before
 //   each row as well as over the whole history, for an AttentionVariant of
-//   that window; 0 without.
+//   that window; 0 without;
+// - commitSuffix: the KV path commits of its pages, or none for pages that
+//   never leave their extent (Gemma 4's);
+// - bf16Only: BF16 pages alone, without the INT8 ones (Gemma 4's);
+// - wholeHistory: the whole history's split and reduce, which a geometry of
+//   sliding layers alone leaves out (Gemma 4's, a window of 1023 keys);
+// - sharedKv: projection rows whose key heads are their value heads too, the
+//   values RMS-normalized without a weight (Gemma 4's global layers).
 // Its q/k norm kernels take the norm types its families store (normKernel):
 // F32 and bf16, or F32 alone for the geometries of families that load from
-// GGUFs only (Qwen3.8-Flash-Next's, Flint's).
+// GGUFs only (Qwen3.8-Flash-Next's, Flint's, Gemma 4's).
 struct CompiledAttention final {
   uint32_t queryHeads;
   uint32_t kvHeads;
@@ -70,12 +77,10 @@ constexpr std::array kCompiledAttention{
     CompiledAttention{32, 2, 256, kv::Reads::EveryPage, true, false, 32, false, 0, "_kv2_g16", "_kv2_g8"},
     CompiledAttention{24, 2, 256, kv::Reads::SelectedBlocks, true, false, 32, false, 0, "_kv2_g12", "_kv2_vt"},
     CompiledAttention{32, 4, 128, kv::Reads::EveryPage, false, true, 64, true, 512, "_kv4_g8_d128", "_kv4_d128"},
-    CompiledAttention{.queryHeads = 32, .kvHeads = 4, .headDimension = 512, .reads = kv::Reads::EveryPage,
-     .gated = false, .sinks = false, .rotaryPairs = 256, .unrotated = false, .windowTokens = 0,
-     .suffix = "_kv4_g8_d512", .commitSuffix = std::nullopt, .bf16Only = true, .sharedKv = true},
-    CompiledAttention{.queryHeads = 32, .kvHeads = 16, .headDimension = 256, .reads = kv::Reads::EveryPage,
-     .gated = false, .sinks = false, .rotaryPairs = 128, .unrotated = false, .windowTokens = 1023,
-     .suffix = "_kv16_g2", .commitSuffix = std::nullopt, .bf16Only = true, .wholeHistory = false},
+    CompiledAttention{32, 4, 512, kv::Reads::EveryPage, false, false, 256, false, 0, "_kv4_g8_d512", std::nullopt,
+                      true, true, true},
+    CompiledAttention{32, 16, 256, kv::Reads::EveryPage, false, false, 128, false, 1023, "_kv16_g2", std::nullopt,
+                      true, false},
 };
 
 // Whether a compiled geometry's pages are a layout's: its KV heads, head
