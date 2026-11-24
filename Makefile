@@ -282,6 +282,8 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/KvSlotFormat.cpp \
 	runtime/ops/RoPE.cpp \
 	runtime/ops/RowCopy.cpp \
+	runtime/ops/RowMath.cpp \
+	runtime/ops/BlockDraftAttention.cpp \
 	runtime/ops/Sampling.cpp \
 	runtime/ops/StateCodec.cpp \
 	runtime/ops/Vision.cpp \
@@ -347,6 +349,8 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/QwenTarget.cpp \
 	runtime/model/QwenTargetLoader.cpp \
 	runtime/model/DFlashDraft.cpp \
+	runtime/model/BlockDraft.cpp \
+	runtime/model/Gemma4.cpp \
 	runtime/model/ModelFactory.cpp \
 	runtime/model/ModelSizing.cpp \
 	runtime/model/SlotFile.cpp \

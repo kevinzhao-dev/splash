@@ -4,13 +4,36 @@
 #include "model/SafetensorsCheckpoint.hpp"
 #include "model/WeightImages.hpp"
 
+#include <cstdint>
 #include <filesystem>
+#include <initializer_list>
 #include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace splash::model {
 
 struct DFlashDraftLayout;
+
+// Plans one image of a draft checkpoint's BF16 tensors, each of the shape its
+// reader takes: a norm, a convolution's base kernel or a codebook copied as
+// stored, a projection's parts' rows quantized into af4g64 planes as MLX's
+// affine quantization rounds them. The checkpoint outlives the image.
+class DraftImageBuilder final {
+public:
+  DraftImageBuilder(const SafetensorsCheckpoint &checkpoint, std::string name, uint32_t layer, uint32_t type);
+  void stored(const std::string &name, const std::vector<uint64_t> &shape);
+  // A projection of `columns` inputs: its parts' rows in order.
+  void projection(std::initializer_list<std::pair<std::string, uint64_t>> parts, uint64_t columns);
+  [[nodiscard]] gguf::Image finish();
+
+private:
+  [[nodiscard]] const SourceTensor &require(const std::string &name, const std::vector<uint64_t> &shape) const;
+
+  const SafetensorsCheckpoint &checkpoint_;
+  gguf::ImageBuilder image_;
+};
 
 // A DFlash2 checkpoint as its repository releases it, config.json and BF16
 // safetensors -> the draft's block images (DFlashDraft.cpp), laid out as a
