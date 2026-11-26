@@ -9,54 +9,44 @@
 #include <vector>
 
 namespace splash::model {
+
+DraftImageBuilder::DraftImageBuilder(const SafetensorsCheckpoint &checkpoint, std::string name, uint32_t layer,
+                                     uint32_t type)
+    : checkpoint_(checkpoint), image_(std::move(name), layer, type) {}
+
+void DraftImageBuilder::stored(const std::string &name, const std::vector<uint64_t> &shape) {
+  const SourceTensor &tensor = require(name, shape);
+  image_.copy({name, ggml::kBF16, tensor.offset, 1, tensor.bytes, {}, tensor.file});
+}
+
+void DraftImageBuilder::projection(std::initializer_list<std::pair<std::string, uint64_t>> parts, uint64_t columns) {
+  const QuantFormat &format = kQuantFormats[GGUF_FMT_AF4G64];
+  std::vector<gguf::TensorRows> sources;
+  uint64_t rows = 0;
+  for (const auto &[name, count] : parts) {
+    const SourceTensor &tensor = require(name + ".weight", {count, columns});
+    sources.push_back({name, format.ggml_type, 0, count, ggufRowBytes(format, columns), {}, tensor.file,
+                       {.bfloat16 = &tensor}});
+    rows += count;
+  }
+  gguf::Repack repack = image_.planes(GGUF_FMT_AF4G64, rows, columns, parts.begin()->first);
+  repack.sources = std::move(sources);
+  image_.repack(std::move(repack));
+}
+
+gguf::Image DraftImageBuilder::finish() { return image_.finish(); }
+
+const SourceTensor &DraftImageBuilder::require(const std::string &name, const std::vector<uint64_t> &shape) const {
+  const SourceTensor &tensor = checkpoint_.require(name);
+  if (tensor.dtype != "BF16" || tensor.shape != shape)
+    throw WeightStoreError("source tensor type or shape does not match: " + name);
+  return tensor;
+}
+
 namespace {
 
-// Plans one image from the checkpoint's BF16 tensors, which must have the
-// shapes the draft reads.
-class Builder {
-public:
-  Builder(const SafetensorsCheckpoint &checkpoint, std::string name, uint32_t layer, uint32_t type)
-      : checkpoint_(checkpoint), image_(std::move(name), layer, type) {}
-
-  // A tensor copied as stored: a norm, a convolution's base kernel or a
-  // selector codebook.
-  void stored(const std::string &name, const std::vector<uint64_t> &shape) {
-    const SourceTensor &tensor = require(name, shape);
-    image_.copy({name, ggml::kBF16, tensor.offset, 1, tensor.bytes, {}, tensor.file});
-  }
-
-  // A projection of `columns` inputs: its parts' rows in order, af4g64 planes.
-  void projection(std::initializer_list<std::pair<std::string, uint64_t>> parts, uint64_t columns) {
-    const QuantFormat &format = kQuantFormats[GGUF_FMT_AF4G64];
-    std::vector<gguf::TensorRows> sources;
-    uint64_t rows = 0;
-    for (const auto &[name, count] : parts) {
-      const SourceTensor &tensor = require(name + ".weight", {count, columns});
-      sources.push_back({name, format.ggml_type, 0, count, ggufRowBytes(format, columns), {}, tensor.file,
-                         {.bfloat16 = &tensor}});
-      rows += count;
-    }
-    gguf::Repack repack = image_.planes(GGUF_FMT_AF4G64, rows, columns, parts.begin()->first);
-    repack.sources = std::move(sources);
-    image_.repack(std::move(repack));
-  }
-
-  [[nodiscard]] gguf::Image finish() { return image_.finish(); }
-
-private:
-  const SourceTensor &require(const std::string &name, const std::vector<uint64_t> &shape) const {
-    const SourceTensor &tensor = checkpoint_.require(name);
-    if (tensor.dtype != "BF16" || tensor.shape != shape)
-      throw WeightStoreError("source tensor type or shape does not match: " + name);
-    return tensor;
-  }
-
-  const SafetensorsCheckpoint &checkpoint_;
-  gguf::ImageBuilder image_;
-};
-
 gguf::Image layerImage(const SafetensorsCheckpoint &checkpoint, const DFlashDraftLayout &layout, uint32_t layer) {
-  Builder b(checkpoint, "layer-" + std::to_string(layer) + ".bin", layer, 0);
+  DraftImageBuilder b(checkpoint, "layer-" + std::to_string(layer) + ".bin", layer, 0);
   const std::string prefix = "layers." + std::to_string(layer) + ".";
   const std::string attention = prefix + "self_attn.";
   const uint64_t hidden = layout.hiddenSize, kv = uint64_t{layout.kvHeads} * layout.attentionHeadDimension;
@@ -80,7 +70,7 @@ gguf::Image layerImage(const SafetensorsCheckpoint &checkpoint, const DFlashDraf
 }
 
 gguf::Image modelImage(const SafetensorsCheckpoint &checkpoint, const DFlashDraftLayout &layout) {
-  Builder b(checkpoint, "model.bin", layout.layers, 1);
+  DraftImageBuilder b(checkpoint, "model.bin", layout.layers, 1);
   const std::string selector = "candidate_selector.";
   const uint64_t hidden = layout.hiddenSize;
   b.projection({{"fc", hidden}}, layout.targetHiddenSize());

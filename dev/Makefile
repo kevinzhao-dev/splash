@@ -156,6 +156,15 @@ check-source: architecture-check
 
 test: test-engine test-python
 
+# gemma4-benchmark takes token IDs. This optional tool uses llama.cpp for
+# GGUF tokenization and for an independent logits reference.
+LLAMA_CPP_PREFIX ?= /opt/homebrew/opt/llama.cpp
+GGML_PREFIX ?= /opt/homebrew/opt/ggml
+$(BUILD)/gguf-text: dev/tools/gguf_text.cpp runtime/engine/Json.hpp | $(BUILD)
+	$(CXX) $(ENGINE_CXXFLAGS) -I"$(LLAMA_CPP_PREFIX)/include" -I"$(GGML_PREFIX)/include" $< \
+		-L"$(LLAMA_CPP_PREFIX)/lib" -L"$(GGML_PREFIX)/lib" \
+		-Wl,-rpath,"$(LLAMA_CPP_PREFIX)/lib" -Wl,-rpath,"$(GGML_PREFIX)/lib" -lllama -lggml -o $@
+
 test-http-real: preflight $(TARGET) verify-build-identity
 	TRANSFORMERS_VERBOSITY=error $(PYTHON) dev/tests/smoke_real.py \
 		--model "$(MODEL)" --model-root "$(MODEL_ROOT)" $(HTTP_SMOKE_ARGS)

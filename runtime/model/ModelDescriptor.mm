@@ -1,9 +1,11 @@
 #include "ModelDescriptor.hpp"
+#include "BlockDraft.hpp"
 #include "GgufImage.hpp"
 #include "GgufTarget.hpp"
 #include "SafetensorsImage.hpp"
 #include "VisionLoader.hpp"
 #include "WeightStore.hpp"
+#include "metal/abi/BlockDraft.h"
 #include "metal/abi/DraftAttention.h"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/PagedAttention.h"
@@ -1056,6 +1058,70 @@ void checkVisionSource(std::string_view targetFormat, std::string_view visionFor
     if (descriptor.visionSource != VisionSource::Safetensors && descriptor.visionSource != VisionSource::Gguf)
       throw std::invalid_argument("a vision check needs a vision source");
     VisionLoader(root / "vision", descriptor.visionSource, descriptor.vision).check();
+  }
+}
+
+BlockDraftLayout readBlockDraftLayout(const std::filesystem::path &checkpoint, uint32_t targetLayers,
+                                      uint32_t hiddenSize, uint32_t vocabularySize) {
+  @autoreleasepool {
+    NSDictionary *draft = readObject(checkpoint / "config.json", "block draft config");
+    NSArray *architectures = requireArray(draft, @"architectures", "block draft architectures");
+    if (architectures.count != 1 || ![architectures[0] isEqual:@"DFlashDraftModel"])
+      throw std::invalid_argument("block draft is not a DFlash v1 model");
+    requireNumbers(draft, "checkpoint", "block draft config",
+                   {{"hidden_size", hiddenSize},
+                    {"vocab_size", vocabularySize},
+                    {"head_dim", SPLASH_BLOCK_DRAFT_HEAD_DIMENSION},
+                    {"rms_norm_eps", SPLASH_RMS_EPSILON}});
+    requireBooleans(draft, "block draft config", {{"attention_bias", false}});
+    requireEqual(requireString(draft, @"hidden_act", "block draft config hidden_act"), "silu", "checkpoint",
+                 "block draft config hidden_act");
+    // The layer types decide which layers attend causally (the reference's
+    // default); a config that states it is another draft's.
+    if (draft[@"is_causal"]) throw std::invalid_argument("block draft config is_causal is not supported");
+    if (draft[@"rope_scaling"] && draft[@"rope_scaling"] != [NSNull null])
+      throw std::invalid_argument("block draft config rope_scaling is not supported");
+    BlockDraftLayout layout;
+    layout.hiddenSize = hiddenSize;
+    layout.vocabularySize = vocabularySize;
+    layout.layers = requireWhole(draft[@"num_hidden_layers"], "block draft config num_hidden_layers");
+    layout.queryHeads = requireWhole(draft[@"num_attention_heads"], "block draft config num_attention_heads");
+    layout.kvHeads = requireWhole(draft[@"num_key_value_heads"], "block draft config num_key_value_heads");
+    layout.intermediateSize = requireWhole(draft[@"intermediate_size"], "block draft config intermediate_size");
+    layout.ropeTheta = static_cast<float>(requireNumber(draft[@"rope_theta"], "block draft config rope_theta").doubleValue);
+    layout.epsilon = SPLASH_RMS_EPSILON;
+    if (!layout.layers || layout.layers > 64 || !layout.kvHeads || layout.queryHeads % layout.kvHeads ||
+        layout.queryHeads / layout.kvHeads > 32 || layout.intermediateSize % 64 || !(layout.ropeTheta > 0))
+      throw std::invalid_argument("block draft config has a shape the kernels do not run");
+    NSArray *types = requireArray(draft, @"layer_types", "block draft config layer_types");
+    if (types.count != layout.layers) throw std::invalid_argument("block draft config layer_types per layer");
+    for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+      if (![types[layer] isKindOfClass:[NSString class]])
+        throw std::invalid_argument("block draft config layer type must be a string");
+      const char *text = static_cast<NSString *>(types[layer]).UTF8String;
+      const std::string type = text ? text : "";
+      if (type == "sliding_attention") layout.slidingLayers |= uint64_t{1} << layer;
+      else if (type != "full_attention") throw std::invalid_argument("unsupported block draft layer type " + type);
+    }
+    if (layout.slidingLayers)
+      layout.window = requireWhole(draft[@"sliding_window"], "block draft config sliding_window");
+    NSDictionary *flash = requireObject(draft, @"dflash_config", "block draft config dflash_config");
+    layout.maskToken = requireWhole(flash[@"mask_token_id"], "block draft config mask_token_id");
+    layout.blockSize = flash[@"block_size"] ? requireWhole(flash[@"block_size"], "block draft config block_size")
+                                            : requireWhole(draft[@"block_size"], "block draft config block_size");
+    if (flash[@"input_embedding_scale"])
+      layout.inputScale = static_cast<float>(
+          requireNumber(flash[@"input_embedding_scale"], "block draft config input_embedding_scale").doubleValue);
+    if (layout.blockSize < 2 || layout.blockSize > 32 || layout.maskToken >= vocabularySize)
+      throw std::invalid_argument("block draft config block_size or mask_token_id is out of range");
+    for (id value : requireArray(flash, @"target_layer_ids", "block draft config target_layer_ids")) {
+      const uint32_t layer = requireWhole(value, "block draft config target layer");
+      if (layer >= targetLayers || (!layout.targetLayers.empty() && layer <= layout.targetLayers.back()))
+        throw std::invalid_argument("block draft target layers must be ascending target layers");
+      layout.targetLayers.push_back(layer);
+    }
+    if (layout.targetLayers.empty()) throw std::invalid_argument("block draft config names no target layer");
+    return layout;
   }
 }
 
